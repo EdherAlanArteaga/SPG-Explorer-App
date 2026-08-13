@@ -69,6 +69,255 @@ def L_gamma(A, gamma):
     return Dg @ L @ Dg
 
 
+def render_full_analysis(G, key_prefix=""):
+    """Renders the complete single-network analysis (summary + 5 tabs).
+    key_prefix keeps widget keys unique when called for different networks.
+    Default key_prefix="" reproduces the exact original single-network mode."""
+    N = G.number_of_nodes()
+    if N < 4:
+        st.error("The network needs at least 4 connected nodes.")
+        st.stop()
+    grande = N > 800
+    if N > 3000:
+        st.warning(f"This network has {N} nodes — computation may take a few minutes.")
+
+    nodes = list(G.nodes())
+    A = nx.to_numpy_array(G, nodelist=nodes)
+    deg = A.sum(1)
+    L0 = np.diag(deg) - A
+
+    with st.spinner("Computing spectrum and observables…"):
+        V, ev, evec, k0 = V_de_L(L0)
+        if V is None:
+            st.error("This network does not have a well-defined Fiedler mode.")
+            st.stop()
+        tau_t = tau_tilde_de_L(V, ev, evec, k0)
+
+    sp_rho, _ = spearmanr(deg, V)
+    pe_rho, _ = pearsonr(V, 1 / deg)
+    r2 = pe_rho ** 2
+    density = A.sum() / (N * (N - 1))
+    cv_deg = deg.std() / deg.mean()
+
+    # ----------------------------------------------------------------------
+    # Summary panel
+    # ----------------------------------------------------------------------
+    st.divider()
+    st.subheader("2️⃣ Network summary")
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Nodes", N)
+    c2.metric("Edges", G.number_of_edges())
+    c3.metric("Density", f"{density:.4f}")
+    c4.metric("Degree CV", f"{cv_deg:.2f}")
+    c5.metric("Spearman(k, V)", f"{sp_rho:+.3f}")
+
+    if abs(sp_rho) > 0.7:
+        veredicto = "🔴 Strong anti-centrality: higher-degree nodes tend to retain less."
+    elif abs(sp_rho) > 0.3:
+        veredicto = "🟡 Moderate anti-centrality."
+    else:
+        veredicto = "⚪ No clear anti-centrality — possibly a network with homogeneous degree."
+    st.markdown(f"**Verdict:** {veredicto}")
+
+    # ----------------------------------------------------------------------
+    # Tabs
+    # ----------------------------------------------------------------------
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📊 Degree vs. V", "🏆 Node table", "🔬 Vs. classical centralities",
+        "🧭 Operator dependence", "🌊 Temporal dynamics"
+    ])
+
+    # --- TAB 1: degree vs V ---
+    with tab1:
+        st.markdown("### Degree vs. spectral persistence")
+        fig1, ax1 = plt.subplots(figsize=(6.5, 4.8))
+        ax1.scatter(deg, V, alpha=0.6, s=28, color="#1a1a1a")
+        ax1.set_xlabel("degree"); ax1.set_ylabel("V (= L⁺_ii)")
+        ax1.set_xscale("log"); ax1.set_yscale("log")
+        ax1.set_title("Log-log scale")
+        st.pyplot(fig1)
+
+        st.markdown("### How much of this is simple 1/degree scaling?")
+        fig1b, ax1b = plt.subplots(figsize=(6.5, 4.8))
+        ax1b.scatter(1/deg, V, alpha=0.6, s=28, color="#555555")
+        ax1b.set_xlabel("1 / degree"); ax1b.set_ylabel("V")
+        ax1b.set_title(f"R² = {r2:.3f}")
+        st.pyplot(fig1b)
+        st.caption(
+            f"If R² is close to 1.0, V is almost entirely explained by the "
+            f"trivial scaling V≈c/degree. In the original study, this value "
+            f"ranged from 0.38 to 1.00 across 11 real networks, with density as "
+            f"the best partial predictor found (a moderate correlation, not a "
+            f"clean law)."
+        )
+
+    # --- TAB 2: node table ---
+    with tab2:
+        st.markdown("### Nodes ranked by persistence (V)")
+        tabla = pd.DataFrame({
+            "node": nodes, "degree": deg.astype(int), "V": V, "τ̃": tau_t,
+        }).sort_values("V", ascending=False).reset_index(drop=True)
+        tabla.index += 1
+
+        colA, colB = st.columns(2)
+        with colA:
+            st.markdown("**Top 10 — highest persistence (best 'retainers')**")
+            st.dataframe(tabla.head(10), use_container_width=True)
+        with colB:
+            st.markdown("**Bottom 10 — lowest persistence (best 'spreaders')**")
+            st.dataframe(tabla.tail(10).sort_values("V"), use_container_width=True)
+
+        st.markdown("### Full table")
+        st.dataframe(tabla, use_container_width=True, height=350)
+
+        csv_out = tabla.to_csv(index=True).encode("utf-8")
+        st.download_button("⬇️ Download full table (CSV)", data=csv_out,
+                            file_name="spg_nodes.csv", mime="text/csv")
+
+    # --- TAB 3: vs classical centralities ---
+    with tab3:
+        st.markdown("### V vs. classical centralities")
+        if grande:
+            st.warning(
+                "Large network (>800 nodes): betweenness and current-flow "
+                "closeness can be slow. Enable if you have time to wait."
+            )
+            correr_completo = st.checkbox("Compute anyway (may take a while)")
+        else:
+            correr_completo = True
+
+        if correr_completo:
+            with st.spinner("Computing classical centralities…"):
+                eig_c = nx.eigenvector_centrality_numpy(G)
+                clo_c = nx.closeness_centrality(G)
+                try:
+                    cfc_c = nx.current_flow_closeness_centrality(G)
+                except Exception:
+                    cfc_c = {n: np.nan for n in nodes}
+                btw_c = nx.betweenness_centrality(G) if N <= 2000 else None
+
+            comp = pd.DataFrame({
+                "degree": deg,
+                "V": V,
+                "eigenvector": [eig_c[n] for n in nodes],
+                "closeness": [clo_c[n] for n in nodes],
+                "current_flow_closeness": [cfc_c[n] for n in nodes],
+            })
+            if btw_c is not None:
+                comp["betweenness"] = [btw_c[n] for n in nodes]
+
+            st.markdown("**Rank correlation (Spearman) of V against each metric:**")
+            filas = []
+            for col in comp.columns:
+                if col == "V":
+                    continue
+                rho, _ = spearmanr(V, comp[col])
+                filas.append({"metric": col, "Spearman(V, ·)": round(rho, 3)})
+            tabla_corr = pd.DataFrame(filas).sort_values("Spearman(V, ·)", key=abs, ascending=False)
+            st.dataframe(tabla_corr, use_container_width=True, hide_index=True)
+
+            cfc_rho = tabla_corr.loc[tabla_corr["metric"] == "current_flow_closeness", "Spearman(V, ·)"]
+            if len(cfc_rho) and abs(cfc_rho.values[0]) > 0.95:
+                st.info(
+                    "V ranks nodes almost identically to *current-flow closeness "
+                    "centrality* — they are strongly related but **not the same "
+                    "quantity** (they differ in exact value, not just rank order; "
+                    "see paper, Section 4)."
+                )
+        else:
+            st.info("Enable the checkbox to compute classical centralities.")
+
+    # --- TAB 4: operator dependence ---
+    with tab4:
+        st.markdown("### Is the anti-correlation about the network, or the diffusion operator?")
+        st.caption(
+            "L_γ = D⁻ᵞ(D−A)D⁻ᵞ. γ=0 → combinatorial Laplacian (diagonal = degree). "
+            "γ=0.5 → symmetric normalized Laplacian (diagonal uniformly = 1). "
+            "**This is the strongest finding of the original project.**"
+        )
+        gamma_max = st.slider("Compute up to γ =", 0.1, 0.5, 0.5, 0.05, key=f"{key_prefix}gamma_slider")
+        n_pasos = st.slider("Resolution (number of points)", 5, 25, 12)
+
+        if st.button("▶️ Run γ sweep"):
+            gammas = np.linspace(0, gamma_max, n_pasos)
+            rhos = []
+            barra = st.progress(0)
+            for i, g in enumerate(gammas):
+                Lg = L_gamma(A, g)
+                Vg, _, _, k0g = V_de_L(Lg)
+                rho_g = spearmanr(Vg, deg)[0] if Vg is not None else np.nan
+                rhos.append(rho_g)
+                barra.progress((i + 1) / len(gammas))
+            barra.empty()
+
+            fig2, ax2 = plt.subplots(figsize=(6.5, 4.8))
+            ax2.plot(gammas, rhos, marker='o', color="#1a1a1a", linewidth=2)
+            ax2.axhline(0, color='grey', lw=0.7, linestyle='--')
+            ax2.set_xlabel("γ  (0 = combinatorial · 0.5 = symmetric normalized)")
+            ax2.set_ylabel("Spearman(degree, V_γ)")
+            ax2.set_title("Collapse of the anti-correlation as the operator is normalized")
+            st.pyplot(fig2)
+
+            caida = rhos[0] - rhos[-1]
+            st.markdown(
+                f"**From γ=0 to γ={gamma_max}: {rhos[0]:+.3f} → {rhos[-1]:+.3f}.**  \n" +
+                ("Confirms strong operator dependence — the anti-correlation is NOT "
+                 "a pure property of this topology." if abs(caida) > 0.3 else
+                 "In this network the effect is more stable against the operator "
+                 "than the average of the original study — an interesting case to "
+                 "investigate further.")
+            )
+
+    # --- TAB 5: temporal dynamics ---
+    with tab5:
+        st.markdown("### Self-retention: how fast does a node lose its own energy?")
+        st.caption(
+            "A perturbation is injected at a single node, and we measure how much "
+            "of it remains at that same node after time T. V predicts this almost "
+            "perfectly at short T, and the prediction degrades at long T."
+        )
+        if grande:
+            st.warning("Large network: this computation uses expm(-TL), it may be slow.")
+
+        if st.button("▶️ Run temporal retention analysis"):
+            Ts = [0.01, 0.05, 0.1, 0.3, 0.5, 1.0, 2.0, 5.0]
+            rhos_t = []
+            barra2 = st.progress(0)
+            for i, T in enumerate(Ts):
+                ET = expm(-L0 * T)
+                ret = np.array([ET[j, j] ** 2 for j in range(N)])
+                rho_t, _ = spearmanr(V, ret)
+                rhos_t.append(rho_t)
+                barra2.progress((i + 1) / len(Ts))
+            barra2.empty()
+
+            fig3, ax3 = plt.subplots(figsize=(6.5, 4.8))
+            ax3.plot(Ts, rhos_t, marker='o', color="#1a1a1a", linewidth=2)
+            ax3.set_xscale("log")
+            ax3.axhline(0, color='grey', lw=0.7, linestyle='--')
+            ax3.set_xlabel("T (diffusion time)")
+            ax3.set_ylabel("Spearman(V, self-retention at time T)")
+            ax3.set_title("V predicts well at short T; the prediction decays at long T")
+            st.pyplot(fig3)
+            st.markdown(
+                f"At T={Ts[0]}: Spearman={rhos_t[0]:+.3f}. At T={Ts[-1]}: "
+                f"Spearman={rhos_t[-1]:+.3f}. This is consistent with V, being an "
+                "integral from 0 to ∞, being dominated by the system's short-time "
+                "behavior."
+            )
+
+    # ----------------------------------------------------------------------
+    st.divider()
+    st.caption(
+        "🕸️ SPG Explorer · Exploration tool based on the empirical audit "
+        "published by Edher Alan Arteaga Marroquín "
+        "(ORCID 0009-0004-7333-1975), DOI 10.5281/zenodo.21815650. "
+        "This is not a claim that V is a new observable or superior to classical "
+        "centralities — see the paper for full context and limitations."
+    )
+
+
 # ----------------------------------------------------------------------
 # Interface
 # ----------------------------------------------------------------------
@@ -227,11 +476,20 @@ if modo == "⚖️ Compare multiple networks":
     )
 
     st.divider()
-    st.caption(
-        "🕸️ SPG Explorer · Comparison mode. Based on the empirical audit "
-        "published by Edher Alan Arteaga Marroquín (ORCID 0009-0004-7333-1975), "
-        "DOI 10.5281/zenodo.21815650."
+    st.subheader("🔍 Drill into one network")
+    st.markdown(
+        "Pick any network from the comparison above to see its full "
+        "breakdown — the same 5-tab analysis available in single-network mode."
     )
+    nombres_validos = tabla_multi["network"].tolist()
+    red_elegida = st.selectbox("Network to inspect in detail", ["(none)"] + nombres_validos)
+
+    if red_elegida != "(none)":
+        Gm_elegida = next(Gm for Gm, nombre in fuentes if nombre == red_elegida)
+        st.divider()
+        st.markdown(f"## Detailed analysis — {red_elegida}")
+        render_full_analysis(Gm_elegida, key_prefix=f"cmp_{red_elegida}_")
+
     st.stop()
 
 # ========================================================================
@@ -310,246 +568,5 @@ if G is None:
     st.warning("Upload an edge-list CSV or pick a sample network to continue.")
     st.stop()
 
-N = G.number_of_nodes()
-if N < 4:
-    st.error("The network needs at least 4 connected nodes.")
-    st.stop()
-grande = N > 800
-if N > 3000:
-    st.warning(f"This network has {N} nodes — computation may take a few minutes.")
+render_full_analysis(G)
 
-nodes = list(G.nodes())
-A = nx.to_numpy_array(G, nodelist=nodes)
-deg = A.sum(1)
-L0 = np.diag(deg) - A
-
-with st.spinner("Computing spectrum and observables…"):
-    V, ev, evec, k0 = V_de_L(L0)
-    if V is None:
-        st.error("This network does not have a well-defined Fiedler mode.")
-        st.stop()
-    tau_t = tau_tilde_de_L(V, ev, evec, k0)
-
-sp_rho, _ = spearmanr(deg, V)
-pe_rho, _ = pearsonr(V, 1 / deg)
-r2 = pe_rho ** 2
-density = A.sum() / (N * (N - 1))
-cv_deg = deg.std() / deg.mean()
-
-# ----------------------------------------------------------------------
-# Summary panel
-# ----------------------------------------------------------------------
-st.divider()
-st.subheader("2️⃣ Network summary")
-
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Nodes", N)
-c2.metric("Edges", G.number_of_edges())
-c3.metric("Density", f"{density:.4f}")
-c4.metric("Degree CV", f"{cv_deg:.2f}")
-c5.metric("Spearman(k, V)", f"{sp_rho:+.3f}")
-
-if abs(sp_rho) > 0.7:
-    veredicto = "🔴 Strong anti-centrality: higher-degree nodes tend to retain less."
-elif abs(sp_rho) > 0.3:
-    veredicto = "🟡 Moderate anti-centrality."
-else:
-    veredicto = "⚪ No clear anti-centrality — possibly a network with homogeneous degree."
-st.markdown(f"**Verdict:** {veredicto}")
-
-# ----------------------------------------------------------------------
-# Tabs
-# ----------------------------------------------------------------------
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📊 Degree vs. V", "🏆 Node table", "🔬 Vs. classical centralities",
-    "🧭 Operator dependence", "🌊 Temporal dynamics"
-])
-
-# --- TAB 1: degree vs V ---
-with tab1:
-    st.markdown("### Degree vs. spectral persistence")
-    fig1, ax1 = plt.subplots(figsize=(6.5, 4.8))
-    ax1.scatter(deg, V, alpha=0.6, s=28, color="#1a1a1a")
-    ax1.set_xlabel("degree"); ax1.set_ylabel("V (= L⁺_ii)")
-    ax1.set_xscale("log"); ax1.set_yscale("log")
-    ax1.set_title("Log-log scale")
-    st.pyplot(fig1)
-
-    st.markdown("### How much of this is simple 1/degree scaling?")
-    fig1b, ax1b = plt.subplots(figsize=(6.5, 4.8))
-    ax1b.scatter(1/deg, V, alpha=0.6, s=28, color="#555555")
-    ax1b.set_xlabel("1 / degree"); ax1b.set_ylabel("V")
-    ax1b.set_title(f"R² = {r2:.3f}")
-    st.pyplot(fig1b)
-    st.caption(
-        f"If R² is close to 1.0, V is almost entirely explained by the "
-        f"trivial scaling V≈c/degree. In the original study, this value "
-        f"ranged from 0.38 to 1.00 across 11 real networks, with density as "
-        f"the best partial predictor found (a moderate correlation, not a "
-        f"clean law)."
-    )
-
-# --- TAB 2: node table ---
-with tab2:
-    st.markdown("### Nodes ranked by persistence (V)")
-    tabla = pd.DataFrame({
-        "node": nodes, "degree": deg.astype(int), "V": V, "τ̃": tau_t,
-    }).sort_values("V", ascending=False).reset_index(drop=True)
-    tabla.index += 1
-
-    colA, colB = st.columns(2)
-    with colA:
-        st.markdown("**Top 10 — highest persistence (best 'retainers')**")
-        st.dataframe(tabla.head(10), use_container_width=True)
-    with colB:
-        st.markdown("**Bottom 10 — lowest persistence (best 'spreaders')**")
-        st.dataframe(tabla.tail(10).sort_values("V"), use_container_width=True)
-
-    st.markdown("### Full table")
-    st.dataframe(tabla, use_container_width=True, height=350)
-
-    csv_out = tabla.to_csv(index=True).encode("utf-8")
-    st.download_button("⬇️ Download full table (CSV)", data=csv_out,
-                        file_name="spg_nodes.csv", mime="text/csv")
-
-# --- TAB 3: vs classical centralities ---
-with tab3:
-    st.markdown("### V vs. classical centralities")
-    if grande:
-        st.warning(
-            "Large network (>800 nodes): betweenness and current-flow "
-            "closeness can be slow. Enable if you have time to wait."
-        )
-        correr_completo = st.checkbox("Compute anyway (may take a while)")
-    else:
-        correr_completo = True
-
-    if correr_completo:
-        with st.spinner("Computing classical centralities…"):
-            eig_c = nx.eigenvector_centrality_numpy(G)
-            clo_c = nx.closeness_centrality(G)
-            try:
-                cfc_c = nx.current_flow_closeness_centrality(G)
-            except Exception:
-                cfc_c = {n: np.nan for n in nodes}
-            btw_c = nx.betweenness_centrality(G) if N <= 2000 else None
-
-        comp = pd.DataFrame({
-            "degree": deg,
-            "V": V,
-            "eigenvector": [eig_c[n] for n in nodes],
-            "closeness": [clo_c[n] for n in nodes],
-            "current_flow_closeness": [cfc_c[n] for n in nodes],
-        })
-        if btw_c is not None:
-            comp["betweenness"] = [btw_c[n] for n in nodes]
-
-        st.markdown("**Rank correlation (Spearman) of V against each metric:**")
-        filas = []
-        for col in comp.columns:
-            if col == "V":
-                continue
-            rho, _ = spearmanr(V, comp[col])
-            filas.append({"metric": col, "Spearman(V, ·)": round(rho, 3)})
-        tabla_corr = pd.DataFrame(filas).sort_values("Spearman(V, ·)", key=abs, ascending=False)
-        st.dataframe(tabla_corr, use_container_width=True, hide_index=True)
-
-        cfc_rho = tabla_corr.loc[tabla_corr["metric"] == "current_flow_closeness", "Spearman(V, ·)"]
-        if len(cfc_rho) and abs(cfc_rho.values[0]) > 0.95:
-            st.info(
-                "V ranks nodes almost identically to *current-flow closeness "
-                "centrality* — they are strongly related but **not the same "
-                "quantity** (they differ in exact value, not just rank order; "
-                "see paper, Section 4)."
-            )
-    else:
-        st.info("Enable the checkbox to compute classical centralities.")
-
-# --- TAB 4: operator dependence ---
-with tab4:
-    st.markdown("### Is the anti-correlation about the network, or the diffusion operator?")
-    st.caption(
-        "L_γ = D⁻ᵞ(D−A)D⁻ᵞ. γ=0 → combinatorial Laplacian (diagonal = degree). "
-        "γ=0.5 → symmetric normalized Laplacian (diagonal uniformly = 1). "
-        "**This is the strongest finding of the original project.**"
-    )
-    gamma_max = st.slider("Compute up to γ =", 0.1, 0.5, 0.5, 0.05, key="gamma_slider")
-    n_pasos = st.slider("Resolution (number of points)", 5, 25, 12)
-
-    if st.button("▶️ Run γ sweep"):
-        gammas = np.linspace(0, gamma_max, n_pasos)
-        rhos = []
-        barra = st.progress(0)
-        for i, g in enumerate(gammas):
-            Lg = L_gamma(A, g)
-            Vg, _, _, k0g = V_de_L(Lg)
-            rho_g = spearmanr(Vg, deg)[0] if Vg is not None else np.nan
-            rhos.append(rho_g)
-            barra.progress((i + 1) / len(gammas))
-        barra.empty()
-
-        fig2, ax2 = plt.subplots(figsize=(6.5, 4.8))
-        ax2.plot(gammas, rhos, marker='o', color="#1a1a1a", linewidth=2)
-        ax2.axhline(0, color='grey', lw=0.7, linestyle='--')
-        ax2.set_xlabel("γ  (0 = combinatorial · 0.5 = symmetric normalized)")
-        ax2.set_ylabel("Spearman(degree, V_γ)")
-        ax2.set_title("Collapse of the anti-correlation as the operator is normalized")
-        st.pyplot(fig2)
-
-        caida = rhos[0] - rhos[-1]
-        st.markdown(
-            f"**From γ=0 to γ={gamma_max}: {rhos[0]:+.3f} → {rhos[-1]:+.3f}.**  \n" +
-            ("Confirms strong operator dependence — the anti-correlation is NOT "
-             "a pure property of this topology." if abs(caida) > 0.3 else
-             "In this network the effect is more stable against the operator "
-             "than the average of the original study — an interesting case to "
-             "investigate further.")
-        )
-
-# --- TAB 5: temporal dynamics ---
-with tab5:
-    st.markdown("### Self-retention: how fast does a node lose its own energy?")
-    st.caption(
-        "A perturbation is injected at a single node, and we measure how much "
-        "of it remains at that same node after time T. V predicts this almost "
-        "perfectly at short T, and the prediction degrades at long T."
-    )
-    if grande:
-        st.warning("Large network: this computation uses expm(-TL), it may be slow.")
-
-    if st.button("▶️ Run temporal retention analysis"):
-        Ts = [0.01, 0.05, 0.1, 0.3, 0.5, 1.0, 2.0, 5.0]
-        rhos_t = []
-        barra2 = st.progress(0)
-        for i, T in enumerate(Ts):
-            ET = expm(-L0 * T)
-            ret = np.array([ET[j, j] ** 2 for j in range(N)])
-            rho_t, _ = spearmanr(V, ret)
-            rhos_t.append(rho_t)
-            barra2.progress((i + 1) / len(Ts))
-        barra2.empty()
-
-        fig3, ax3 = plt.subplots(figsize=(6.5, 4.8))
-        ax3.plot(Ts, rhos_t, marker='o', color="#1a1a1a", linewidth=2)
-        ax3.set_xscale("log")
-        ax3.axhline(0, color='grey', lw=0.7, linestyle='--')
-        ax3.set_xlabel("T (diffusion time)")
-        ax3.set_ylabel("Spearman(V, self-retention at time T)")
-        ax3.set_title("V predicts well at short T; the prediction decays at long T")
-        st.pyplot(fig3)
-        st.markdown(
-            f"At T={Ts[0]}: Spearman={rhos_t[0]:+.3f}. At T={Ts[-1]}: "
-            f"Spearman={rhos_t[-1]:+.3f}. This is consistent with V, being an "
-            "integral from 0 to ∞, being dominated by the system's short-time "
-            "behavior."
-        )
-
-# ----------------------------------------------------------------------
-st.divider()
-st.caption(
-    "🕸️ SPG Explorer · Exploration tool based on the empirical audit "
-    "published by Edher Alan Arteaga Marroquín "
-    "(ORCID 0009-0004-7333-1975), DOI 10.5281/zenodo.21815650. "
-    "This is not a claim that V is a new observable or superior to classical "
-    "centralities — see the paper for full context and limitations."
-)
