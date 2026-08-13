@@ -108,6 +108,136 @@ benchmark, it did not — see paper, Section 8).
 
 st.divider()
 
+# --- mode selector ---
+modo = st.radio(
+    "Mode",
+    ["🔍 Analyze one network", "⚖️ Compare multiple networks"],
+    horizontal=True,
+)
+st.divider()
+
+# ========================================================================
+# MODE 2: COMPARE MULTIPLE NETWORKS
+# ========================================================================
+if modo == "⚖️ Compare multiple networks":
+    st.subheader("Upload several networks to compare")
+    st.markdown(
+        "Same edge-list CSV format as single-network mode (two columns, no "
+        "header, no self-loops). Upload two or more files — each is analyzed "
+        "independently and the results are compared side by side."
+    )
+    archivos_multi = st.file_uploader(
+        "CSV files", type=["csv"], accept_multiple_files=True, key="multi_uploader"
+    )
+
+    incluir_demo = st.checkbox("Also include the three built-in sample networks", value=False)
+
+    resultados_multi = []
+    fuentes = []
+    if archivos_multi:
+        for f in archivos_multi:
+            try:
+                df = pd.read_csv(f, comment='#', header=None)
+                Gm = cargar_grafo(df)
+                fuentes.append((Gm, f.name))
+            except Exception as e:
+                st.error(f"Could not read {f.name}: {e}")
+
+    if incluir_demo:
+        fuentes.append((nx.karate_club_graph(), "Karate Club"))
+        Ger = nx.erdos_renyi_graph(150, 0.06, seed=1)
+        Ger = Ger.subgraph(max(nx.connected_components(Ger), key=len)).copy()
+        fuentes.append((Ger, "Erdős–Rényi (150n)"))
+        fuentes.append((nx.barabasi_albert_graph(150, 2, seed=1), "Barabási–Albert (150n)"))
+
+    if len(fuentes) < 2:
+        st.warning("Upload at least two networks (or check the sample-networks box) to compare.")
+        st.stop()
+
+    with st.spinner(f"Computing spectral persistence for {len(fuentes)} networks…"):
+        barra_multi = st.progress(0)
+        filas_multi = []
+        for i, (Gm, nombre) in enumerate(fuentes):
+            Nm = Gm.number_of_nodes()
+            if Nm < 4:
+                st.warning(f"Skipping '{nombre}': fewer than 4 nodes.")
+                barra_multi.progress((i + 1) / len(fuentes))
+                continue
+            Am = nx.to_numpy_array(Gm, nodelist=list(Gm.nodes()))
+            degm = Am.sum(1)
+            Lm = np.diag(degm) - Am
+            Vm, evm, evecm, k0m = V_de_L(Lm)
+            if Vm is None:
+                st.warning(f"Skipping '{nombre}': no well-defined Fiedler mode.")
+                barra_multi.progress((i + 1) / len(fuentes))
+                continue
+            sp_m, _ = spearmanr(degm, Vm)
+            pe_m, _ = pearsonr(Vm, 1 / degm)
+            dens_m = Am.sum() / (Nm * (Nm - 1))
+            cv_m = degm.std() / degm.mean()
+
+            # operator-dependence check at gamma=0.5 (fast, single point)
+            Lg_half = L_gamma(Am, 0.5)
+            Vg_half, _, _, _ = V_de_L(Lg_half)
+            sp_half = spearmanr(Vg_half, degm)[0] if Vg_half is not None else np.nan
+
+            filas_multi.append({
+                "network": nombre,
+                "nodes": Nm,
+                "edges": Gm.number_of_edges(),
+                "density": round(dens_m, 4),
+                "degree CV": round(cv_m, 2),
+                "Spearman(k,V) γ=0": round(sp_m, 3),
+                "Spearman(k,V) γ=0.5": round(sp_half, 3) if not np.isnan(sp_half) else None,
+                "R²(V, 1/k)": round(pe_m ** 2, 3),
+            })
+            barra_multi.progress((i + 1) / len(fuentes))
+        barra_multi.empty()
+
+    tabla_multi = pd.DataFrame(filas_multi)
+    st.markdown("### Comparison table")
+    st.dataframe(tabla_multi, use_container_width=True, hide_index=True)
+
+    csv_multi = tabla_multi.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ Download comparison table (CSV)", data=csv_multi,
+                        file_name="spg_network_comparison.csv", mime="text/csv")
+
+    st.markdown("### Anti-correlation strength across networks")
+    fig_multi, ax_multi = plt.subplots(figsize=(8, max(3, 0.4 * len(tabla_multi))))
+    ax_multi.barh(tabla_multi["network"], tabla_multi["Spearman(k,V) γ=0"], color="#1a1a1a")
+    ax_multi.axvline(0, color="grey", lw=0.7)
+    ax_multi.set_xlabel("Spearman(degree, V), combinatorial Laplacian (γ=0)")
+    st.pyplot(fig_multi)
+
+    st.markdown("### Does the effect survive normalizing the operator (γ: 0 → 0.5)?")
+    fig_multi2, ax_multi2 = plt.subplots(figsize=(8, max(3, 0.4 * len(tabla_multi))))
+    x = np.arange(len(tabla_multi))
+    w = 0.35
+    ax_multi2.barh(x - w/2, tabla_multi["Spearman(k,V) γ=0"], height=w, label="γ=0 (combinatorial)", color="#1a1a1a")
+    ax_multi2.barh(x + w/2, tabla_multi["Spearman(k,V) γ=0.5"].fillna(0), height=w, label="γ=0.5 (normalized)", color="#aaaaaa")
+    ax_multi2.set_yticks(x); ax_multi2.set_yticklabels(tabla_multi["network"])
+    ax_multi2.axvline(0, color="grey", lw=0.7)
+    ax_multi2.legend()
+    st.pyplot(fig_multi2)
+    st.caption(
+        "If the dark bars are much longer than the light bars for most "
+        "networks, that reproduces the project's central finding: the "
+        "anti-correlation depends heavily on the diffusion operator, not "
+        "just on network topology."
+    )
+
+    st.divider()
+    st.caption(
+        "🕸️ SPG Explorer · Comparison mode. Based on the empirical audit "
+        "published by Edher Alan Arteaga Marroquín (ORCID 0009-0004-7333-1975), "
+        "DOI 10.5281/zenodo.21815650."
+    )
+    st.stop()
+
+# ========================================================================
+# MODE 1: SINGLE NETWORK ANALYSIS (unchanged below this point)
+# ========================================================================
+
 # --- data upload ---
 st.subheader("1️⃣ Upload your network")
 
